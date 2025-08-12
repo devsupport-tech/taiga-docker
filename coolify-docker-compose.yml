@@ -1,0 +1,238 @@
+version: "3.8"
+
+x-environment:
+  &default-back-environment
+  # Database settings
+  POSTGRES_DB: "taiga"
+  POSTGRES_USER: "${POSTGRES_USER:-taiga}"
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-taiga}"
+  POSTGRES_HOST: "taiga-db"
+  # Taiga settings
+  TAIGA_SECRET_KEY: "${SECRET_KEY:-change-me-to-a-secure-value}"
+  TAIGA_SITES_SCHEME: "${TAIGA_SCHEME:-https}"
+  TAIGA_SITES_DOMAIN: "${TAIGA_DOMAIN:-taiga.example.com}"
+  TAIGA_SUBPATH: "${SUBPATH:-}"
+  # Email settings
+  EMAIL_BACKEND: "django.core.mail.backends.${EMAIL_BACKEND:-console}.EmailBackend"
+  DEFAULT_FROM_EMAIL: "${EMAIL_DEFAULT_FROM:-no-reply@example.com}"
+  EMAIL_USE_TLS: "${EMAIL_USE_TLS:-True}"
+  EMAIL_USE_SSL: "${EMAIL_USE_SSL:-False}"
+  EMAIL_HOST: "${EMAIL_HOST:-smtp.gmail.com}"
+  EMAIL_PORT: "${EMAIL_PORT:-587}"
+  EMAIL_HOST_USER: "${EMAIL_HOST_USER:-}"
+  EMAIL_HOST_PASSWORD: "${EMAIL_HOST_PASSWORD:-}"
+  # RabbitMQ settings
+  RABBITMQ_USER: "${RABBITMQ_USER:-taiga}"
+  RABBITMQ_PASS: "${RABBITMQ_PASS:-taiga}"
+  # Telemetry
+  ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-False}"
+  # Additional features (uncomment to enable)
+  # PUBLIC_REGISTER_ENABLED: "${PUBLIC_REGISTER_ENABLED:-False}"
+  # ENABLE_GITHUB_AUTH: "${ENABLE_GITHUB_AUTH:-False}"
+  # GITHUB_API_CLIENT_ID: "${GITHUB_API_CLIENT_ID:-}"
+  # GITHUB_API_CLIENT_SECRET: "${GITHUB_API_CLIENT_SECRET:-}"
+  # ENABLE_GITLAB_AUTH: "${ENABLE_GITLAB_AUTH:-False}"
+  # GITLAB_API_CLIENT_ID: "${GITLAB_API_CLIENT_ID:-}"
+  # GITLAB_API_CLIENT_SECRET: "${GITLAB_API_CLIENT_SECRET:-}"
+  # GITLAB_URL: "${GITLAB_URL:-https://gitlab.com}"
+  # ENABLE_SLACK: "${ENABLE_SLACK:-False}"
+
+x-volumes:
+  &default-back-volumes
+  - taiga-static-data:/taiga-back/static
+  - taiga-media-data:/taiga-back/media
+
+services:
+  taiga-db:
+    image: postgres:12.3
+    container_name: taiga-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "taiga"
+      POSTGRES_USER: "${POSTGRES_USER:-taiga}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-taiga}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-taiga}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - taiga-db-data:/var/lib/postgresql/data
+    networks:
+      - taiga-network
+
+  taiga-back:
+    image: taigaio/taiga-back:latest
+    container_name: taiga-back
+    restart: unless-stopped
+    environment: *default-back-environment
+    volumes: *default-back-volumes
+    networks:
+      - taiga-network
+    depends_on:
+      taiga-db:
+        condition: service_healthy
+      taiga-events-rabbitmq:
+        condition: service_started
+      taiga-async-rabbitmq:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api/v1/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  taiga-async:
+    image: taigaio/taiga-back:latest
+    container_name: taiga-async
+    restart: unless-stopped
+    entrypoint: ["/taiga-back/docker/async_entrypoint.sh"]
+    environment: *default-back-environment
+    volumes: *default-back-volumes
+    networks:
+      - taiga-network
+    depends_on:
+      taiga-db:
+        condition: service_healthy
+      taiga-events-rabbitmq:
+        condition: service_started
+      taiga-async-rabbitmq:
+        condition: service_started
+
+  taiga-async-rabbitmq:
+    image: rabbitmq:3.8-management-alpine
+    container_name: taiga-async-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "${RABBITMQ_ERLANG_COOKIE:-secret-erlang-cookie}"
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-taiga}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-taiga}"
+      RABBITMQ_DEFAULT_VHOST: "${RABBITMQ_VHOST:-taiga}"
+    hostname: "taiga-async-rabbitmq"
+    volumes:
+      - taiga-async-rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - taiga-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  taiga-front:
+    image: taigaio/taiga-front:latest
+    container_name: taiga-front
+    restart: unless-stopped
+    environment:
+      TAIGA_URL: "${TAIGA_SCHEME:-https}://${TAIGA_DOMAIN:-taiga.example.com}"
+      TAIGA_WEBSOCKETS_URL: "${WEBSOCKETS_SCHEME:-wss}://${TAIGA_DOMAIN:-taiga.example.com}"
+      TAIGA_SUBPATH: "${SUBPATH:-}"
+      # Frontend feature flags (uncomment to enable)
+      # PUBLIC_REGISTER_ENABLED: "${PUBLIC_REGISTER_ENABLED:-false}"
+      # ENABLE_GITHUB_AUTH: "${ENABLE_GITHUB_AUTH:-false}"
+      # GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
+      # ENABLE_GITLAB_AUTH: "${ENABLE_GITLAB_AUTH:-false}"
+      # GITLAB_CLIENT_ID: "${GITLAB_CLIENT_ID:-}"
+      # GITLAB_URL: "${GITLAB_URL:-https://gitlab.com}"
+      # ENABLE_SLACK: "${ENABLE_SLACK:-false}"
+    networks:
+      - taiga-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  taiga-events:
+    image: taigaio/taiga-events:latest
+    container_name: taiga-events
+    restart: unless-stopped
+    environment:
+      RABBITMQ_USER: "${RABBITMQ_USER:-taiga}"
+      RABBITMQ_PASS: "${RABBITMQ_PASS:-taiga}"
+      TAIGA_SECRET_KEY: "${SECRET_KEY:-change-me-to-a-secure-value}"
+    networks:
+      - taiga-network
+    depends_on:
+      taiga-events-rabbitmq:
+        condition: service_started
+
+  taiga-events-rabbitmq:
+    image: rabbitmq:3.8-management-alpine
+    container_name: taiga-events-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "${RABBITMQ_ERLANG_COOKIE:-secret-erlang-cookie}"
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-taiga}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-taiga}"
+      RABBITMQ_DEFAULT_VHOST: "${RABBITMQ_VHOST:-taiga}"
+    hostname: "taiga-events-rabbitmq"
+    volumes:
+      - taiga-events-rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - taiga-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  taiga-protected:
+    image: taigaio/taiga-protected:latest
+    container_name: taiga-protected
+    restart: unless-stopped
+    environment:
+      MAX_AGE: "${ATTACHMENTS_MAX_AGE:-360}"
+      SECRET_KEY: "${SECRET_KEY:-change-me-to-a-secure-value}"
+    networks:
+      - taiga-network
+
+  taiga-gateway:
+    image: nginx:1.19-alpine
+    container_name: taiga-gateway
+    restart: unless-stopped
+    ports:
+      - "${TAIGA_PORT:-9000}:80"
+    volumes:
+      - ./taiga-gateway/taiga.conf:/etc/nginx/conf.d/default.conf:ro
+      - taiga-static-data:/taiga/static:ro
+      - taiga-media-data:/taiga/media
+    networks:
+      - taiga-network
+    depends_on:
+      - taiga-front
+      - taiga-back
+      - taiga-events
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      # Coolify labels for automatic proxy configuration
+      coolify.managed: "true"
+      coolify.type: "application"
+      coolify.name: "Taiga"
+      coolify.description: "Open Source Project Management Platform"
+      # If you want Coolify to handle SSL/proxy (recommended)
+      # coolify.domain: "${TAIGA_DOMAIN:-taiga.example.com}"
+      # coolify.port: "80"
+
+volumes:
+  taiga-static-data:
+    driver: local
+  taiga-media-data:
+    driver: local
+  taiga-db-data:
+    driver: local
+  taiga-async-rabbitmq-data:
+    driver: local
+  taiga-events-rabbitmq-data:
+    driver: local
+
+networks:
+  taiga-network:
+    driver: bridge
+    name: taiga-network
